@@ -2,11 +2,9 @@
 
 use App\Ai\Agents\ChatAgent;
 use Illuminate\Support\Facades\Route;
-use App\Livewire\Chat;
 
-Route::get('/chat',function(){
-    dd('test');
-});
+
+Route::get('/chat', 'App\\Livewire\\Chat')->name('chat');
 
 Route::get('/ai-test', function () {
     $response = (new ChatAgent)->prompt('ايش تقدر تطلع لي  المنتجات المخفضة من امازون السعودية');

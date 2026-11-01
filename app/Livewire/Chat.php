@@ -2,89 +2,118 @@
 
 namespace App\Livewire;
 
-use Livewire\Attributes\Layout;
+use Illuminate\Support\Facades\Http;
 use Livewire\Component;
-use Prism\Prism\Facades\Prism;
-use Prism\Prism\ValueObjects\Messages\AssistantMessage;
-use Prism\Prism\ValueObjects\Messages\UserMessage;
 
-#[Layout('layouts.app')]
 class Chat extends Component
 {
-    public string $prompt = '';
-    public array $messages = [];          // مصفوفة عادية — لا مشكلة تعديل متداخل معها
-    public bool $isLoading = false;
-    public string $model = 'llama3.2';
-    public string $systemPrompt = 'أنت مساعد ذكي تجيب بالعربية بشكل مختصر وواضح.';
+    public array $messages = [];
+
+    public string $message = '';
+
+    public string $model = '';
+
+    public bool $loading = false;
+
+    public ?string $error = null;
 
     public function mount(): void
     {
-        $this->model = env('OLLAMA_MODEL', 'llama3.2');
+        $this->model = config('services.ollama.model', env('OLLAMA_MODEL', 'qwen3:0.6b'));
+        $this->startConversation();
     }
 
-    public function sendMessage(): void
+    protected function startConversation(): void
     {
-        $this->validate([
-            'prompt' => 'required|string|min:1|max:4000',
-        ]);
-
-        $question = trim($this->prompt);
-        $this->prompt = '';
-
-        // 1. ابنِ السياق من الرسائل السابقة قبل إضافة الجديدة
-        $history = $this->buildHistory();
-
-        // 2. أضف رسالة المستخدم + مكان فاضي للرد
-        $this->messages[] = ['role' => 'user', 'content' => $question];
-        $this->messages[] = ['role' => 'assistant', 'content' => ''];
-
-        $index = count($this->messages) - 1;
-        $this->isLoading = true;
-
-        try {
-            $response = Prism::text()
-                ->using('ollama', $this->model)
-                ->withSystemPrompt($this->systemPrompt)
-                ->withMessages([
-                    ...$history,
-                    new UserMessage($question),
-                ])
-                ->generate();
-
-            $this->messages[$index]['content'] = $response->text ?: '(رد فارغ من النموذج)';
-
-        } catch (\Throwable $e) {
-            $this->messages[$index]['content'] = '❌ خطأ: '.$e->getMessage();
-        } finally {
-            $this->isLoading = false;
-            $this->dispatch('scroll-to-bottom');
-        }
-    }
-
-    /**
-     * تحويل الرسائل المخزنة إلى كائنات Prism
-     */
-    private function buildHistory(): array
-    {
-        $history = [];
-
-        foreach ($this->messages as $msg) {
-            if (trim($msg['content']) === '') {
-                continue; // تجاهل الرسائل الفارغة
-            }
-
-            $history[] = $msg['role'] === 'user'
-                ? new UserMessage($msg['content'])
-                : new AssistantMessage($msg['content']);
-        }
-
-        // آخر 12 رسالة فقط حتى لا يكبر السياق بلا حدود
-        return array_slice($history, -12);
+        $this->messages = [
+            [
+                'role' => 'system',
+                'content' => 'أنت مساعد حكومي سعودي محترف. تجيب باللغة العربية الفصحى بوضوح واحترافية واختصار.',
+            ],
+            [
+                'role' => 'assistant',
+                'content' => 'مرحباً بك، أنا مساعد تجريبي يعمل محلياً عبر Ollama. كيف أقدر أخدمك؟',
+            ],
+        ];
     }
 
     public function clearChat(): void
     {
-        $this->messages = [];
+        $this->reset([
+            'message',
+            'error',
+            'loading',
+        ]);
+
+        $this->startConversation();
+        $this->dispatch('chat:message-added');
+    }
+
+    public function send(): void
+    {
+        if ($this->loading) {
+            return;
+        }
+
+        $this->validate(
+            [
+                'message' => ['required', 'string', 'max:8000'],
+            ],
+            [],
+            [
+                'message' => 'الرسالة',
+            ]
+        );
+
+        $this->error = null;
+
+        $this->messages[] = [
+            'role' => 'user',
+            'content' => trim($this->message),
+        ];
+
+        $this->message = '';
+        $this->loading = true;
+
+        try {
+            $url = rtrim(config('services.ollama.url', env('OLLAMA_URL', 'http://172.17.0.1:11434')), '/');
+            $currentModel = $this->model;
+
+            $response = Http::timeout(300)
+                ->connectTimeout(10)
+                ->post($url . '/api/chat', [
+                    'model' => $currentModel,
+                    'messages' => $this->messages,
+                    'stream' => false,
+                    'options' => [
+                        'temperature' => 0.3,
+                    ],
+                ]);
+
+            if ($response->failed()) {
+                throw new \RuntimeException('Ollama returned status: ' . $response->status());
+            }
+
+            $answer = $response->json('message.content');
+
+            if (! is_string($answer) || trim($answer) === '') {
+                throw new \RuntimeException('Empty response from Ollama.');
+            }
+
+            $this->messages[] = [
+                'role' => 'assistant',
+                'content' => $answer,
+            ];
+        } catch (\Throwable $e) {
+            logger()->error('Ollama chat error', [
+                'message' => $e->getMessage(),
+            ]);
+
+            $this->error = 'تعذر الحصول على رد من Ollama. الخطأ: ' . $e->getMessage();
+        }
+
+        $this->loading = false;
+        $this->dispatch('chat:message-added');
     }
 
     public function render()
